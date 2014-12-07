@@ -23,8 +23,6 @@
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/fstream.hpp>
 
-#include <boost/unordered_set.hpp>
-
 using namespace std;
 using namespace boost;
 
