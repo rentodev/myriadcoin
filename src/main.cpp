@@ -23,6 +23,8 @@
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/fstream.hpp>
 
+#include <boost/unordered_set.hpp>
+
 using namespace std;
 using namespace boost;
 
@@ -81,36 +83,6 @@ namespace {
     {
         bool operator()(CBlockIndex *pa, CBlockIndex *pb)
         {
-            if ( (pa->nHeight >= nBlockAlgoNormalisedWorkStart2) ||
-                 (pb->nHeight >= nBlockAlgoNormalisedWorkStart2) )
-            {
-                // First sort by most work per algo, ...
-                int aWins = 0, bWins = 0;
-                for (int i = 0; i < NUM_ALGOS; i++)
-                {
-                    if (pa->nAlgoWork[i] > pb->nAlgoWork[i]) aWins++;
-                    if (pa->nAlgoWork[i] < pb->nAlgoWork[i]) bWins++;
-                }
-                if (aWins > bWins) return false;
-                if (aWins < bWins) return true;
-
-                // ... then by number of blocks ...
-                if (pa->nHeight > pb->nHeight) return false;
-                if (pa->nHeight < pb->nHeight) return true;
-
-                // ... then by earliest time received, ...
-                if (pa->nSequenceId < pb->nSequenceId) return false;
-                if (pa->nSequenceId > pb->nSequenceId) return true;
-
-                // Use pointer address as tie breaker (should only happen with blocks
-                // loaded from disk, as those all have id 0).
-                if (pa < pb) return false;
-                if (pa > pb) return true;
-
-                // Identical blocks.
-                return false;
-            }
-
             // First sort by most total work, ...
             if (pa->nChainWork > pb->nChainWork) return false;
             if (pa->nChainWork < pb->nChainWork) return true;
@@ -129,9 +101,42 @@ namespace {
         }
     };
 
+    struct CBlockIndexWorkComparator2
+    {
+        bool operator()(CBlockIndex *pa, CBlockIndex *pb)
+        {
+            // First sort by most work per algo, ...
+            int aWins = 0, bWins = 0;
+            for (int i = 0; i < NUM_ALGOS; i++)
+            {
+                if (pa->nAlgoWork[i] > pb->nAlgoWork[i]) aWins++;
+                if (pa->nAlgoWork[i] < pb->nAlgoWork[i]) bWins++;
+            }
+            if (aWins > bWins) return false;
+            if (aWins < bWins) return true;
+
+            // ... then by number of blocks ...
+            if (pa->nHeight > pb->nHeight) return false;
+            if (pa->nHeight < pb->nHeight) return true;
+
+            // ... then by earliest time received, ...
+            if (pa->nSequenceId < pb->nSequenceId) return false;
+            if (pa->nSequenceId > pb->nSequenceId) return true;
+
+            // Use pointer address as tie breaker (should only happen with blocks
+            // loaded from disk, as those all have id 0).
+            if (pa < pb) return false;
+            if (pa > pb) return true;
+
+            // Identical blocks.
+            return false;
+        }
+    };
+
     CBlockIndex *pindexBestInvalid;
     // may contain all CBlockIndex*'s that have validness >=BLOCK_VALID_TRANSACTIONS, and must contain those who aren't failed
     set<CBlockIndex*, CBlockIndexWorkComparator> setBlockIndexValid;
+    set<CBlockIndex*, CBlockIndexWorkComparator2> setBlockIndexValid2; // interim measure to transition between comparator1 and comparator2
 
     CCriticalSection cs_LastBlockFile;
     CBlockFileInfo infoLastBlockFile;
@@ -1653,6 +1658,7 @@ void static InvalidBlockFound(CBlockIndex *pindex, const CValidationState &state
         pindex->nStatus |= BLOCK_FAILED_VALID;
         pblocktree->WriteBlockIndex(CDiskBlockIndex(pindex));
         setBlockIndexValid.erase(pindex);
+        setBlockIndexValid2.erase(pindex);
         InvalidChainFound(pindex);
     }
 }
@@ -2229,20 +2235,36 @@ bool static ConnectTip(CValidationState &state, CBlockIndex *pindexNew) {
 
 // Make chainMostWork correspond to the chain with the most work in it, that isn't
 // known to be invalid (it's however far from certain to be valid).
-void static FindMostWorkChain() {
+void static FindMostWorkChain()
+{
+
+    int CompareVersion = 1;
+    if (chainActive.Tip() && (chainActive.Tip()->nHeight >= nBlockAlgoCountWorkStart))
+        CompareVersion = 2;
+
     CBlockIndex *pindexNew = NULL;
 
     // In case the current best is invalid, do not consider it.
     while (chainMostWork.Tip() && (chainMostWork.Tip()->nStatus & BLOCK_FAILED_MASK)) {
         setBlockIndexValid.erase(chainMostWork.Tip());
+        setBlockIndexValid2.erase(chainMostWork.Tip());
         chainMostWork.SetTip(chainMostWork.Tip()->pprev);
     }
 
-    do {
+    do
+    {
         // Find the best candidate header.
+        if (CompareVersion == 1)
         {
             std::set<CBlockIndex*, CBlockIndexWorkComparator>::reverse_iterator it = setBlockIndexValid.rbegin();
             if (it == setBlockIndexValid.rend())
+                return;
+            pindexNew = *it;
+        }
+        else
+        {
+            std::set<CBlockIndex*, CBlockIndexWorkComparator2>::reverse_iterator it = setBlockIndexValid2.rbegin();
+            if (it == setBlockIndexValid2.rend())
                 return;
             pindexNew = *it;
         }
@@ -2259,6 +2281,7 @@ void static FindMostWorkChain() {
                 while (pindexTest != pindexFailed) {
                     pindexFailed->nStatus |= BLOCK_FAILED_CHILD;
                     setBlockIndexValid.erase(pindexFailed);
+                    setBlockIndexValid2.erase(pindexFailed);
                     pindexFailed = pindexFailed->pprev;
                 }
                 fInvalidAncestor = true;
@@ -2273,8 +2296,16 @@ void static FindMostWorkChain() {
     } while(true);
 
     // Check whether it's actually an improvement.
-    if (chainMostWork.Tip() && !CBlockIndexWorkComparator()(chainMostWork.Tip(), pindexNew))
-        return;
+    if (CompareVersion == 1)
+    {
+        if (chainMostWork.Tip() && !CBlockIndexWorkComparator()(chainMostWork.Tip(), pindexNew))
+            return;
+    }
+    else
+    {
+        if (chainMostWork.Tip() && !CBlockIndexWorkComparator2()(chainMostWork.Tip(), pindexNew))
+            return;
+    }
 
     // We have a new best.
     chainMostWork.SetTip(pindexNew);
@@ -2364,6 +2395,7 @@ bool AddToBlockIndex(CBlock& block, CValidationState& state, const CDiskBlockPos
     pindexNew->nUndoPos = 0;
     pindexNew->nStatus = BLOCK_VALID_TRANSACTIONS | BLOCK_HAVE_DATA;
     setBlockIndexValid.insert(pindexNew);
+    setBlockIndexValid2.insert(pindexNew);
 
     if (!pblocktree->WriteBlockIndex(CDiskBlockIndex(pindexNew)))
         return state.Abort(_("Failed to write block index"));
@@ -3068,7 +3100,10 @@ bool static LoadBlockIndexDB()
         pindex->nChainWork = (pindex->pprev ? pindex->pprev->nChainWork : 0) + pindex->GetBlockWorkAdjusted().getuint256();
         pindex->nChainTx = (pindex->pprev ? pindex->pprev->nChainTx : 0) + pindex->nTx;
         if ((pindex->nStatus & BLOCK_VALID_MASK) >= BLOCK_VALID_TRANSACTIONS && !(pindex->nStatus & BLOCK_FAILED_MASK))
+        {
             setBlockIndexValid.insert(pindex);
+            setBlockIndexValid2.insert(pindex);
+        }
         if (pindex->nStatus & BLOCK_FAILED_MASK && (!pindexBestInvalid || pindex->nChainWork > pindexBestInvalid->nChainWork))
             pindexBestInvalid = pindex;
     }
@@ -3179,6 +3214,7 @@ void UnloadBlockIndex()
 {
     mapBlockIndex.clear();
     setBlockIndexValid.clear();
+    setBlockIndexValid2.clear();
     chainActive.SetTip(NULL);
     pindexBestInvalid = NULL;
 }
